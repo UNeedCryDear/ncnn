@@ -170,6 +170,8 @@ set(pnnx_pass_level2_SRCS
     pass_level2/Tensor_expand_as.cpp
     pass_level2/Tensor_index.cpp
     pass_level2/Tensor_new_empty.cpp
+    pass_level2/Tensor_new_ones.cpp
+    pass_level2/Tensor_new_zeros.cpp
     pass_level2/Tensor_repeat.cpp
     pass_level2/Tensor_reshape.cpp
     pass_level2/Tensor_select.cpp
@@ -181,11 +183,13 @@ set(pnnx_pass_level2_SRCS
     pass_level2/torch_arange.cpp
     pass_level2/torch_argmax.cpp
     pass_level2/torch_argmin.cpp
+    pass_level2/torch_bmm.cpp
     pass_level2/torch_cat.cpp
     pass_level2/torch_chunk.cpp
     pass_level2/torch_clamp.cpp
     pass_level2/torch_clone.cpp
     pass_level2/torch_dequantize.cpp
+    pass_level2/torch_einsum.cpp
     pass_level2/torch_empty.cpp
     pass_level2/torch_empty_like.cpp
     pass_level2/torch_flatten.cpp
@@ -194,7 +198,9 @@ set(pnnx_pass_level2_SRCS
     pass_level2/torch_full_like.cpp
     pass_level2/torch_logsumexp.cpp
     pass_level2/torch_matmul.cpp
+    pass_level2/torch_max.cpp
     pass_level2/torch_mean.cpp
+    pass_level2/torch_min.cpp
     pass_level2/torch_norm.cpp
     pass_level2/torch_normal.cpp
     pass_level2/torch_ones.cpp
@@ -226,8 +232,10 @@ set(pnnx_pass_level3_SRCS
     pass_level3/expand_quantization_modules.cpp
     pass_level3/fuse_cat_stack_tensors.cpp
     pass_level3/fuse_chunk_split_unbind_unpack.cpp
+    pass_level3/fuse_einsum_operands.cpp
     pass_level3/fuse_expression.cpp
     pass_level3/fuse_index_expression.cpp
+    pass_level3/fuse_multiheadattention_unpack.cpp
     pass_level3/fuse_rnn_unpack.cpp
     pass_level3/rename_F_conv_transposend.cpp
     pass_level3/rename_F_convmode.cpp
@@ -244,6 +252,7 @@ set(pnnx_pass_level5_SRCS
     pass_level5/eliminate_dropout.cpp
     pass_level5/eliminate_identity_operator.cpp
     pass_level5/eliminate_maxpool_indices.cpp
+    pass_level5/eliminate_noop_einsum.cpp
     pass_level5/eliminate_noop_expression.cpp
     pass_level5/eliminate_noop_pad.cpp
     pass_level5/eliminate_slice.cpp
@@ -260,6 +269,8 @@ set(pnnx_pass_level5_SRCS
     pass_level5/fuse_linear_batchnorm1d.cpp
     pass_level5/fuse_select_to_unbind.cpp
     pass_level5/fuse_slice_indices.cpp
+    pass_level5/fuse_static_conv.cpp
+    pass_level5/normalize_einsum_equation.cpp
     pass_level5/unroll_rnn_op.cpp
 )
 
@@ -270,8 +281,10 @@ set(pnnx_pass_ncnn_SRCS
     pass_ncnn/convert_input.cpp
     pass_ncnn/convert_torch_cat.cpp
     pass_ncnn/convert_torch_chunk.cpp
+    pass_ncnn/convert_torch_einsum.cpp
     pass_ncnn/convert_torch_split.cpp
     pass_ncnn/convert_torch_unbind.cpp
+    pass_ncnn/convert_Tensor_select.cpp
     pass_ncnn/eliminate_output.cpp
     pass_ncnn/expand_expression.cpp
     pass_ncnn/insert_split.cpp
@@ -406,12 +419,15 @@ set(pnnx_pass_ncnn_SRCS
     pass_ncnn/torch_addmm.cpp
     pass_ncnn/torch_amax.cpp
     pass_ncnn/torch_amin.cpp
+    pass_ncnn/torch_bmm.cpp
     pass_ncnn/torch_clamp.cpp
     pass_ncnn/torch_clone.cpp
     pass_ncnn/torch_flatten.cpp
     pass_ncnn/torch_logsumexp.cpp
     pass_ncnn/torch_matmul.cpp
+    pass_ncnn/torch_max.cpp
     pass_ncnn/torch_mean.cpp
+    pass_ncnn/torch_min.cpp
     pass_ncnn/torch_permute.cpp
     pass_ncnn/torch_prod.cpp
     pass_ncnn/torch_squeeze.cpp
@@ -456,6 +472,10 @@ if(PNNX_COVERAGE)
     target_link_libraries(pnnx PUBLIC -coverage -lgcov)
 endif()
 
+if(WIN32)
+    target_compile_definitions(pnnx PUBLIC NOMINMAX)
+endif()
+
 if(TorchVision_FOUND)
     target_link_libraries(pnnx PRIVATE TorchVision::TorchVision)
 endif()
@@ -463,13 +483,17 @@ endif()
 if(WIN32)
     target_link_libraries(pnnx PRIVATE ${TORCH_LIBRARIES})
 else()
-    target_link_libraries(pnnx PRIVATE ${TORCH_LIBRARIES} dl)
+    target_link_libraries(pnnx PRIVATE ${TORCH_LIBRARIES} pthread dl)
 endif()
 
 #set_target_properties(pnnx PROPERTIES COMPILE_FLAGS -fsanitize=address)
 #set_target_properties(pnnx PROPERTIES LINK_FLAGS -fsanitize=address)
 
-set_target_properties(pnnx PROPERTIES INSTALL_RPATH "$ORIGIN/")
+if(APPLE)
+    set_target_properties(pnnx PROPERTIES INSTALL_RPATH "@executable_path/")
+else()
+    set_target_properties(pnnx PROPERTIES INSTALL_RPATH "$ORIGIN/")
+endif()
 set_target_properties(pnnx PROPERTIES MACOSX_RPATH TRUE)
 
 install(TARGETS pnnx RUNTIME DESTINATION bin)

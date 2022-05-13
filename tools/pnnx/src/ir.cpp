@@ -392,6 +392,42 @@ bool operator==(const Attribute& lhs, const Attribute& rhs)
     return true;
 }
 
+Attribute operator+(const Attribute& a, const Attribute& b)
+{
+    Attribute c;
+
+    if (a.type != b.type)
+    {
+        fprintf(stderr, "concat attribute type mismatch\n");
+        return c;
+    }
+
+    if (a.shape.size() != b.shape.size())
+    {
+        fprintf(stderr, "concat attribute shape rank mismatch\n");
+        return c;
+    }
+
+    for (int i = 1; i < (int)a.shape.size(); i++)
+    {
+        if (a.shape[i] != b.shape[i])
+        {
+            fprintf(stderr, "concat attribute shape mismatch\n");
+            return c;
+        }
+    }
+
+    c.type = a.type;
+    c.shape = a.shape;
+    c.shape[0] += b.shape[0]; // concat the first dim
+
+    c.data.resize(a.data.size() + b.data.size());
+    memcpy(c.data.data(), a.data.data(), a.data.size());
+    memcpy(c.data.data() + a.data.size(), b.data.data(), b.data.size());
+
+    return c;
+}
+
 Parameter Parameter::parse_from_string(const std::string& value)
 {
     Parameter p;
@@ -1599,6 +1635,19 @@ int Graph::python(const std::string& pypath, const std::string& pnnxbinpath)
                 fprintf(pyfp, ", dim=%d", op->params.at("dim").i);
                 fprintf(pyfp, ")\n");
             }
+            else if (op->type == "torch.einsum")
+            {
+                // einsum
+                fprintf(pyfp, "v_%s = %s(", sanitize_identifier(op->outputs[0]->name).c_str(), op->type.c_str());
+
+                fprintf(pyfp, "\'%s\'", op->params.at("equation").s.c_str());
+
+                for (size_t i = 0; i < op->inputs.size(); i++)
+                {
+                    fprintf(pyfp, ", v_%s", sanitize_identifier(op->inputs[i]->name).c_str());
+                }
+                fprintf(pyfp, ")\n");
+            }
             else if (op->type == "prim::TupleUnpack")
             {
                 for (size_t i = 0; i < op->outputs.size(); i++)
@@ -1656,6 +1705,38 @@ int Graph::python(const std::string& pypath, const std::string& pnnxbinpath)
                 if (op->inputs.size() == 3)
                 {
                     fprintf(pyfp, ", (v_%s, v_%s)", sanitize_identifier(op->inputs[1]->name).c_str(), sanitize_identifier(op->inputs[2]->name).c_str());
+                }
+                fprintf(pyfp, ")\n");
+            }
+            else if (op->type == "nn.MultiheadAttention")
+            {
+                if (op->outputs.size() == 1)
+                {
+                    fprintf(pyfp, "v_%s, _", sanitize_identifier(op->outputs[0]->name).c_str());
+                }
+                else
+                {
+                    for (size_t i = 0; i < op->outputs.size(); i++)
+                    {
+                        fprintf(pyfp, "v_%s", sanitize_identifier(op->outputs[i]->name).c_str());
+                        if (i + 1 != op->outputs.size())
+                            fprintf(pyfp, ", ");
+                    }
+                }
+                fprintf(pyfp, " = self.%s(", sanitize_identifier(op->name).c_str());
+                if (op->inputs.size() == 1)
+                {
+                    const char* in0 = sanitize_identifier(op->inputs[0]->name).c_str();
+                    fprintf(pyfp, "v_%s, v_%s, v_%s", in0, in0, in0);
+                }
+                else
+                {
+                    for (size_t i = 0; i < op->inputs.size(); i++)
+                    {
+                        fprintf(pyfp, "v_%s", sanitize_identifier(op->inputs[i]->name).c_str());
+                        if (i + 1 != op->inputs.size())
+                            fprintf(pyfp, ", ");
+                    }
                 }
                 fprintf(pyfp, ")\n");
             }
@@ -1924,6 +2005,127 @@ int Graph::python(const std::string& pypath, const std::string& pnnxbinpath)
 
     fprintf(pyfp, "\n");
 
+    // export onnx
+    {
+        fprintf(pyfp, "def export_onnx():\n");
+        fprintf(pyfp, "    net = Model()\n");
+        fprintf(pyfp, "    net.eval()\n");
+        fprintf(pyfp, "\n");
+        fprintf(pyfp, "    torch.manual_seed(0)\n");
+
+        std::vector<std::string> input_names;
+        for (const Operator* op : ops)
+        {
+            if (op->type != "pnnx.Input")
+                continue;
+
+            const Operand* r = op->outputs[0];
+            std::string input_name = std::string("v_") + sanitize_identifier(r->name);
+            if (type_is_integer(r->type))
+            {
+                fprintf(pyfp, "    %s = torch.randint(10, (", input_name.c_str());
+                for (size_t i = 0; i < r->shape.size(); i++)
+                {
+                    fprintf(pyfp, "%d", r->shape[i]);
+                    if (i + 1 != r->shape.size() || r->shape.size() == 1)
+                        fprintf(pyfp, ", ");
+                }
+                fprintf(pyfp, "), dtype=%s)\n", type_to_dtype_string(r->type));
+            }
+            else
+            {
+                fprintf(pyfp, "    %s = torch.rand(", input_name.c_str());
+                for (size_t i = 0; i < r->shape.size(); i++)
+                {
+                    fprintf(pyfp, "%d, ", r->shape[i]);
+                }
+                fprintf(pyfp, "dtype=%s)\n", type_to_dtype_string(r->type));
+            }
+
+            input_names.push_back(input_name);
+        }
+
+        fprintf(pyfp, "\n");
+
+        // torch.onnx._export(net, v_0, "test_swin_t.onnx", export_params=True, opset_version=14, input_names=['in0'], output_names=['out0'])
+
+        if (input_names.size() == 1)
+        {
+            fprintf(pyfp, "    torch.onnx._export(net, %s", input_names[0].c_str());
+        }
+        else
+        {
+            fprintf(pyfp, "    torch.onnx._export(net, (");
+
+            for (size_t i = 0; i < input_names.size(); i++)
+            {
+                fprintf(pyfp, "%s", input_names[i].c_str());
+                if (i + 1 != input_names.size())
+                    fprintf(pyfp, ", ");
+            }
+
+            fprintf(pyfp, ")");
+        }
+
+        fprintf(pyfp, ", \"%s.onnx\", export_params=True, operator_export_type=torch.onnx.OperatorExportTypes.ONNX_ATEN_FALLBACK, opset_version=13", pypath.c_str());
+
+        fprintf(pyfp, ", input_names=[");
+        {
+            int input_count = 0;
+            {
+                for (const Operator* op : ops)
+                {
+                    if (op->type == "pnnx.Input")
+                        input_count++;
+                }
+            }
+
+            int input_index = 0;
+            for (const Operator* op : ops)
+            {
+                if (op->type != "pnnx.Input")
+                    continue;
+
+                fprintf(pyfp, "'in%d'", input_index);
+                if (input_index + 1 != input_count)
+                    fprintf(pyfp, ", ");
+
+                input_index++;
+            }
+        }
+        fprintf(pyfp, "]");
+
+        fprintf(pyfp, ", output_names=[");
+        {
+            int output_count = 0;
+            {
+                for (const Operator* op : ops)
+                {
+                    if (op->type == "pnnx.Output")
+                        output_count++;
+                }
+            }
+
+            int output_index = 0;
+            for (const Operator* op : ops)
+            {
+                if (op->type != "pnnx.Output")
+                    continue;
+
+                fprintf(pyfp, "'out%d'", output_index);
+                if (output_index + 1 != output_count)
+                    fprintf(pyfp, ", ");
+
+                output_index++;
+            }
+        }
+        fprintf(pyfp, "]");
+
+        fprintf(pyfp, ")\n");
+    }
+
+    fprintf(pyfp, "\n");
+
     // test inference
     {
         fprintf(pyfp, "def test_inference():\n");
@@ -1999,6 +2201,60 @@ static bool string_is_positive_integer(const std::string& t)
     }
 
     return true;
+}
+
+static unsigned short float32_to_float16(float value)
+{
+    // 1 : 8 : 23
+    union
+    {
+        unsigned int u;
+        float f;
+    } tmp;
+
+    tmp.f = value;
+
+    // 1 : 8 : 23
+    unsigned short sign = (tmp.u & 0x80000000) >> 31;
+    unsigned short exponent = (tmp.u & 0x7F800000) >> 23;
+    unsigned int significand = tmp.u & 0x7FFFFF;
+
+    //     NCNN_LOGE("%d %d %d", sign, exponent, significand);
+
+    // 1 : 5 : 10
+    unsigned short fp16;
+    if (exponent == 0)
+    {
+        // zero or denormal, always underflow
+        fp16 = (sign << 15) | (0x00 << 10) | 0x00;
+    }
+    else if (exponent == 0xFF)
+    {
+        // infinity or NaN
+        fp16 = (sign << 15) | (0x1F << 10) | (significand ? 0x200 : 0x00);
+    }
+    else
+    {
+        // normalized
+        short newexp = exponent + (-127 + 15);
+        if (newexp >= 31)
+        {
+            // overflow, return infinity
+            fp16 = (sign << 15) | (0x1F << 10) | 0x00;
+        }
+        else if (newexp <= 0)
+        {
+            // Some normal fp32 cannot be expressed as normal fp16
+            fp16 = (sign << 15) | (0x00 << 10) | 0x00;
+        }
+        else
+        {
+            // normal fp16
+            fp16 = (sign << 15) | (newexp << 10) | (significand >> 13);
+        }
+    }
+
+    return fp16;
 }
 
 int Graph::ncnn(const std::string& parampath, const std::string& binpath, const std::string& pypath)
@@ -2136,11 +2392,37 @@ int Graph::ncnn(const std::string& parampath, const std::string& binpath, const 
             }
         }
 
+        bool is_type_flag_fp32 = false;
         for (const auto& it : op->attrs)
         {
             //             fprintf(paramfp, " @%s=", it.first.c_str());
 
             const Attribute& attr = it.second;
+
+            if (is_type_flag_fp32)
+            {
+                // fp32 -> fp16
+                const float* p = (const float*)attr.data.data();
+                int len = attr.data.size() / 4;
+                for (int i = 0; i < len; i++)
+                {
+                    unsigned short v_fp16 = float32_to_float16(p[i]);
+                    fwrite(&v_fp16, sizeof(v_fp16), 1, binfp);
+                }
+
+                is_type_flag_fp32 = false;
+                continue;
+            }
+
+            if (attr.type == 0 && attr.data == std::vector<char> {0, 0, 0, 0})
+            {
+                // write fp16 flag
+                unsigned int fp16_flag = 0x01306B47;
+                fwrite(&fp16_flag, sizeof(fp16_flag), 1, binfp);
+
+                is_type_flag_fp32 = true;
+                continue;
+            }
 
             fwrite(attr.data.data(), attr.data.size(), 1, binfp);
         }
